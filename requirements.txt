@@ -1,0 +1,18 @@
+# 数据处理与获取
+pandas==2.3.3
+numpy==2.2.6
+akshare==1.18.50
+
+# 深度学习与图像
+tensorflow==2.21.0
+Pillow==12.2.0
+mplfinance==0.12.10b0
+
+# 大模型交互与环境配置
+openai==2.30.0
+
+langchain-openai==1.1.12
+langchain-core==1.2.24
+
+python-dotenv==1.2.2
+duckduckgo-search==8.1.1
