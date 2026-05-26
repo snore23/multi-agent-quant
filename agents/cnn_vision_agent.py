@@ -1,6 +1,6 @@
 # agents/cnn_vision_agent.py
 import numpy as np
-from tensorflow.keras.models import load_model
+from keras.models import load_model
 from utils.image_utils import save_to_candlestick_to_buf, preprocess_image_from_buf
 
 class CNNVisionAgent:
