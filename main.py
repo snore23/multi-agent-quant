@@ -52,7 +52,7 @@ def main():
     # 3. 组装并启动回测引擎
     print(">>> 组装回测引擎...")
     engine = BacktestEngine(
-        cnn_agent=cnn_agent,
+        tech_agent=cnn_agent,
         news_agent=news_agent,
         risk_agent=risk_agent,
         meta_agent=meta_agent

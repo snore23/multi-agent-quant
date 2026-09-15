@@ -1,5 +1,6 @@
 # agents/news_rag_agent.py
 import os
+import hashlib
 import requests
 import pandas as pd
 from datetime import timedelta
@@ -18,9 +19,9 @@ class FundamentalNewsAgent:
             model="deepseek-chat",
             api_key=api_key,
             base_url="https://api.deepseek.com/v1",
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=200,
-            timeout = 15
+            timeout=15
         )
 
         self.prompt = PromptTemplate.from_template(
@@ -38,15 +39,11 @@ class FundamentalNewsAgent:
             请直接输出分析结论："""
         )
         self.chain = self.prompt | self.llm | StrOutputParser()
+        self.news_sentiment_cache = {}
 
     def fetch_historical_news(self, ticker, current_date):
-        """
-        获取指定日期前 3 天内的真实新闻。
-        优先加载本地已预下载的历史新闻 CSV，避免在回测主循环中产生高额网络延迟及 API 开销。
-        """
         symbol = ticker.split('.')[-1] if '.' in ticker else ticker
 
-        # 延迟动态加载本地 CSV 缓存（避免频繁读写硬盘）
         if not hasattr(self, 'local_news_df'):
             self.local_news_df = None
             local_file = f"data/{symbol}_news.csv"
@@ -55,13 +52,11 @@ class FundamentalNewsAgent:
                     df = pd.read_csv(local_file)
                     df['datetime'] = pd.to_datetime(df['datetime'])
                     self.local_news_df = df
-                    print(f"📂 [News Agent] 已成功挂载 [{symbol}] 本地历史真实新闻库。")
+                    print(f"[News Agent] 成功挂载 [{symbol}] 本地历史新闻库。")
                 except Exception as e:
-                    print(f"⚠️ [News Agent] 挂载本地 CSV 失败: {e}")
+                    print(f"[News Agent] 挂载本地 CSV 失败: {e}")
 
-        # 1. 优先使用本地真实的、带时间戳的新闻
         if self.local_news_df is not None:
-            # start_date = current_date - timedelta(days=3)
             start_date = current_date - timedelta(days=30)
             mask = (self.local_news_df['datetime'] >= start_date) & (self.local_news_df['datetime'] <= current_date)
             day_news = self.local_news_df.loc[mask]
@@ -74,7 +69,6 @@ class FundamentalNewsAgent:
                     news_list.append(f"- 标题: {headline} | 摘要: {summary}")
                 return "\n".join(news_list)
 
-        # 2. 降级机制：调用 Finnhub API (若回测时间较新且在1年以内，可以生效)
         if not self.finnhub_key:
             return "近期无有效新闻"
 
@@ -102,12 +96,19 @@ class FundamentalNewsAgent:
         if "近期无有效新闻" in news_content:
             return f"基本面新闻分析师报告：截至 {current_date.strftime('%Y-%m-%d')}，近期无有效基本面催化剂，视为中性。"
 
+        # 计算新闻内容哈希，若内容未发生变化直接复用之前的大模型分析结果
+        content_hash = hashlib.md5(news_content.encode('utf-8')).hexdigest()
+        if content_hash in self.news_sentiment_cache:
+            cached_report = self.news_sentiment_cache[content_hash]
+            return f"基本面新闻分析师报告：{cached_report}"
+
         try:
             report = self.chain.invoke({
                 "ticker": ticker,
                 "current_date": current_date.strftime('%Y-%m-%d'),
                 "news_content": news_content
             })
+            self.news_sentiment_cache[content_hash] = report
             return f"基本面新闻分析师报告：{report}"
         except Exception as e:
             return f"基本面新闻分析师报告：大模型分析异常，默认视为中性。({e})"

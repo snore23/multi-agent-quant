@@ -1,221 +1,189 @@
 # backtest/engine.py
 import json
-import time
+import pandas as pd
 from data_fetcher.stock_data import get_stock_kline
 
 
 class BacktestEngine:
-    def __init__(self, cnn_agent, news_agent, risk_agent, meta_agent, commission_rate=0.001):
-        """
-        :param commission_rate: 单边交易费率（默认 0.1%）
-        """
-        self.cnn_agent = cnn_agent
+    def __init__(self, tech_agent=None, news_agent=None, risk_agent=None, meta_agent=None,
+                 cnn_agent=None, commission_rate=0.001, slippage=0.0005):
+        self.tech_agent = tech_agent or cnn_agent
         self.news_agent = news_agent
         self.risk_agent = risk_agent
         self.meta_agent = meta_agent
         self.commission_rate = commission_rate
+        self.slippage = slippage
 
-    def run_backtest(self, ticker="000001", period="5", start_date="2023-01-01 00:00:00",
-                     end_date="2024-04-01 00:00:00"):
-        print(f"\n--- 开始回测 {ticker} [{start_date} 至 {end_date}] ---")
-
-        # 1. 获取 K 线数据
+    def run_backtest(self, ticker="105.NVDA", period="daily", start_date="2023-01-01", end_date="2024-04-01"):
+        print(f"\n[INFO] 开始回测标的: {ticker} [{start_date} 至 {end_date}]")
         df = get_stock_kline(ticker, period=period, start_date=start_date, end_date=end_date)
+        df.reset_index(drop=True, inplace=True)
 
-        print(f">>> 成功获取到 K 线数据: {len(df)} 条")
-        if len(df) <= 30:
-            print("❌ 错误：获取到的数据量不足 30 条（不够均线预热窗口），回测终止！")
+        total_steps = len(df)
+        if total_steps < 40:
+            print("[ERROR] 数据量不足，无法运行。")
             return
 
-        # 2. 初始化账户与状态
-        initial_capital = 100000.0  # 初始资金 10 万
+        initial_capital = 100000.0
         capital = initial_capital
-        position = 0  # 0: 空仓, 1: 多头持仓, -1: 空头持仓
-        entry_price = 0.0  # 开仓价格
-        trade_count = 0  # 统计交易次数
+        position = 0  # 0: 现金, 1: 多头, -1: 空头
+        entry_price = 0.0
 
-        # 双向移动追踪止盈核心变量
-        max_price_since_entry = 0.0  # 多头持仓期间的最高价
-        min_price_since_entry = 99999.0  # 空头持仓期间的最低价
-        trailing_stop_pct = 0.12  # 从极值回撤/反弹 12% 强制止盈
+        max_price_since_entry = 0.0
+        min_price_since_entry = 99999.0
+        trailing_stop_pct = 0.12
 
-        # 从第 30 个时间步开始滑动窗口
-        for i in range(30, len(df)):
+        trade_records = []
+        equity_curve = [initial_capital] * 30
+
+        print(f"[INFO] 历史数据加载完成，有效交易日共 {total_steps} 天，开始滑动回测...\n")
+
+        for i in range(30, total_steps):
             window_df = df.iloc[i - 30:i]
-            current_date = window_df['datetime'].iloc[-1]
-            current_price = float(window_df['Close'].iloc[-1])
+            today_bar = df.iloc[i]
+            current_date = today_bar['datetime']
+            close_price = float(today_bar['Close'])
+            step_progress = f"[{i - 29}/{total_steps - 30}]"
 
-            # ==========================================
-            # 1. 双向 移动追踪止盈 与 硬性止损 检查
-            # ==========================================
-            stop_loss_triggered = False
+            # 1. 硬性止损与移动追踪止盈检查
+            stop_triggered = False
 
             if position == 1:
-                # 更新多头最高价
-                max_price_since_entry = max(max_price_since_entry, current_price)
-                trailing_stop_line = max_price_since_entry * (1 - trailing_stop_pct)
+                max_price_since_entry = max(max_price_since_entry, close_price)
+                trailing_line = max_price_since_entry * (1 - trailing_stop_pct)
+                hard_stop_line = entry_price * 0.90
 
-                # 追踪止盈（自最高点回撤 12%）
-                if current_price < trailing_stop_line:
-                    profit = (current_price - entry_price) / entry_price * capital
-                    capital += profit
+                if close_price < trailing_line or close_price < hard_stop_line:
+                    exec_price = close_price * (1 - self.slippage)
+                    pnl = (exec_price - entry_price) / entry_price * capital
                     fee = capital * self.commission_rate
-                    capital -= fee
+                    capital += (pnl - fee)
+                    reason = "多头移动止盈" if close_price < trailing_line else "多头硬性止损"
+                    trade_records.append({"type": "CLOSE_LONG", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": reason})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [平仓触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
                     position = 0
-                    trade_count += 1
-                    stop_loss_triggered = True
-                    print(
-                        f"🚨 [多头追踪止盈触发] 价格自最高点 {max_price_since_entry:.2f} 回撤 {trailing_stop_pct * 100:.0f}%！"
-                        f"平仓价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
-
-                # 硬性止损（跌破买入价的 10%）
-                elif current_price < entry_price * 0.90:
-                    profit = (current_price - entry_price) / entry_price * capital
-                    capital += profit
-                    fee = capital * self.commission_rate
-                    capital -= fee
-                    position = 0
-                    trade_count += 1
-                    stop_loss_triggered = True
-                    print(f"🚨 [多头硬性止损触发] 价格跌破买入价 10%！"
-                          f"平仓价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
+                    entry_price = 0.0
+                    stop_triggered = True
 
             elif position == -1:
-                # 更新空头最低价
-                min_price_since_entry = min(min_price_since_entry, current_price)
-                trailing_stop_line = min_price_since_entry * (1 + trailing_stop_pct)
+                min_price_since_entry = min(min_price_since_entry, close_price)
+                trailing_line = min_price_since_entry * (1 + trailing_stop_pct)
+                hard_stop_line = entry_price * 1.10
 
-                # 追踪止盈（自最低点反弹 12%）
-                if current_price > trailing_stop_line:
-                    profit = (entry_price - current_price) / entry_price * capital
-                    capital += profit
+                if close_price > trailing_line or close_price > hard_stop_line:
+                    exec_price = close_price * (1 + self.slippage)
+                    pnl = (entry_price - exec_price) / entry_price * capital
                     fee = capital * self.commission_rate
-                    capital -= fee
+                    capital += (pnl - fee)
+                    reason = "空头移动止盈" if close_price > trailing_line else "空头硬性止损"
+                    trade_records.append({"type": "CLOSE_SHORT", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": reason})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [平仓触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
                     position = 0
-                    trade_count += 1
-                    stop_loss_triggered = True
-                    print(
-                        f"🚨 [空头追踪止盈触发] 价格自最低点 {min_price_since_entry:.2f} 反弹 {trailing_stop_pct * 100:.0f}%！"
-                        f"平仓价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
+                    entry_price = 0.0
+                    stop_triggered = True
 
-                # 硬性止损（冲高超过做空价的 10%）
-                elif current_price > entry_price * 1.10:
-                    profit = (entry_price - current_price) / entry_price * capital
-                    capital += profit
-                    fee = capital * self.commission_rate
-                    capital -= fee
-                    position = 0
-                    trade_count += 1
-                    stop_loss_triggered = True
-                    print(f"🚨 [空头硬性止损触发] 价格上涨超过做空价 10%！"
-                          f"平仓价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
-
-            # 若本日已触发止盈止损平仓，直接跳过后续大模型决策，节约 API 额度
-            if stop_loss_triggered:
-                time.sleep(1)
+            if stop_triggered:
+                equity_curve.append(capital)
                 continue
 
-            # ==========================================
-            # 2. 智能体协同决策环节
-            # ==========================================
-            cnn_report = self.cnn_agent.analyze(window_df)
+            # 2. 智能体分析与决策
+            tech_report = self.tech_agent.analyze(window_df)
             news_report = self.news_agent.analyze(ticker, current_date)
             risk_report = self.risk_agent.analyze(window_df)
 
-            decision_json_str = self.meta_agent.make_decision(cnn_report, news_report, risk_report)
+            decision_json_str = self.meta_agent.make_decision(tech_report, news_report, risk_report)
 
             try:
-                # 提取纯 JSON 字典
-                clean_str = decision_json_str.replace('```json', '').replace('```', '').strip()
-                decision = json.loads(clean_str)
-                action = decision.get("action", "WAIT")
-                reason = decision.get("reason", "解析失败")
-            except Exception as e:
-                action = "WAIT"
-                reason = f"JSON 解析错误兜底: {e}"
+                decision = json.loads(decision_json_str)
+                stance = decision.get("stance", "NEUTRAL")
+                reason = decision.get("reason", "无")
+            except Exception:
+                stance = "NEUTRAL"
+                reason = "解析兜底"
 
-            # ==========================================
-            # 3. 交易执行模块 (持有在 WAIT，仅在反转或风控时平仓)
-            # ==========================================
-            print(
-                f"\n[{current_date.strftime('%Y-%m-%d %H:%M:%S')}] 决策信号: {action} | 当前价格: {current_price:.2f} | 理由: {reason}")
+            target_position = 1 if stance == "BULLISH" else -1 if stance == "BEARISH" else 0
 
-            if action == "BUY":
+            # 3. 状态机执行
+            if target_position != position:
+                # 平掉旧仓
                 if position == 1:
-                    print(f"  ➔ [继续持股] 当前已全仓持有多头头寸，中线持股待涨中。(持仓买入价: {entry_price:.2f})")
-                else:
-                    if position == -1:
-                        # 翻转：先平空仓
-                        profit = (entry_price - current_price) / entry_price * capital
-                        capital += profit
-                        fee = capital * self.commission_rate
-                        capital -= fee
-                        print(
-                            f"  🔄 [反转平空仓] 结算价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
-
-                    # 开多仓
+                    exec_price = close_price * (1 - self.slippage)
+                    pnl = (exec_price - entry_price) / entry_price * capital
                     fee = capital * self.commission_rate
-                    capital -= fee
-                    entry_price = current_price
-                    max_price_since_entry = current_price  # 重置多头最高价追踪器
-                    position = 1
-                    trade_count += 1
-                    print(
-                        f"  🟢 [建立多头头寸] 开仓价: {entry_price:.2f} | 交易手续费: {fee:.2f} | 账户总资产(已全仓持股): {capital:.2f}")
+                    capital += (pnl - fee)
+                    trade_records.append({"type": "CLOSE_LONG", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": f"立场转变 -> {stance}"})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [多头平仓] 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 净资产: {capital:.2f}")
+                    position = 0
 
-            elif action == "SELL":
-                if position == -1:
-                    print(f"  ➔ [继续持空] 当前已全仓持有空头头寸，中线持空待跌中。(持仓卖出价: {entry_price:.2f})")
-                else:
-                    if position == 1:
-                        # 翻转：先平多仓
-                        profit = (current_price - entry_price) / entry_price * capital
-                        capital += profit
-                        fee = capital * self.commission_rate
-                        capital -= fee
-                        print(
-                            f"  🔄 [反转平多仓] 结算价: {current_price:.2f} | 盈亏: {profit:+.2f} | 交易手续费: {fee:.2f} | 账户总资产: {capital:.2f}")
-
-                    # 开空仓
-                    fee = capital * self.commission_rate
-                    capital -= fee
-                    entry_price = current_price
-                    min_price_since_entry = current_price  # 重置空头最低价追踪器
-                    position = -1
-                    trade_count += 1
-                    print(
-                        f"  🔴 [建立空头头寸] 开仓价: {entry_price:.2f} | 交易手续费: {fee:.2f} | 账户总资产(已全仓开空): {capital:.2f}")
-
-            else:  # WAIT 信号
-                if position == 1:
-                    print(
-                        f"  ➔ [趋势平稳] 决策官保持观望，我们继续中长线【满仓持股】(持仓买入价: {entry_price:.2f}，当前资产估值: {capital * (current_price / entry_price):.2f})")
                 elif position == -1:
-                    print(
-                        f"  ➔ [趋势平稳] 决策官保持观望，我们继续中长线【持空等待】(持仓卖出价: {entry_price:.2f}，当前资产估值: {capital * (entry_price / current_price):.2f})")
-                else:
-                    print(f"  ➔ [空仓等待] 当前无趋势信号，保持现金观望状态。(总资产: {capital:.2f})")
+                    exec_price = close_price * (1 + self.slippage)
+                    pnl = (entry_price - exec_price) / entry_price * capital
+                    fee = capital * self.commission_rate
+                    capital += (pnl - fee)
+                    trade_records.append({"type": "CLOSE_SHORT", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": f"立场转变 -> {stance}"})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [空头平仓] 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 净资产: {capital:.2f}")
+                    position = 0
 
-            time.sleep(1)
+                # 开新仓
+                if target_position == 1:
+                    exec_price = close_price * (1 + self.slippage)
+                    fee = capital * self.commission_rate
+                    capital -= fee
+                    entry_price = exec_price
+                    max_price_since_entry = exec_price
+                    position = 1
+                    trade_records.append({"type": "OPEN_LONG", "price": exec_price, "fee": fee, "date": current_date, "reason": reason})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [建立多头] 价格: {exec_price:.2f} | 理由: {reason}")
 
-        # 4. 回测结束后强制清仓结算
-        last_price = float(df['Close'].iloc[-1])
-        if position == 1:
-            profit = (last_price - entry_price) / entry_price * capital
-            capital += profit
-            capital *= (1 - self.commission_rate)
-            trade_count += 1
-            print(f"\n🏁 [最终强制平仓] 多头以收盘价 {last_price:.2f} 结算 | 盈亏: {profit:+.2f}")
-        elif position == -1:
-            profit = (entry_price - last_price) / entry_price * capital
-            capital += profit
-            capital *= (1 - self.commission_rate)
-            trade_count += 1
-            print(f"\n🏁 [最终强制平仓] 空头以收盘价 {last_price:.2f} 结算 | 盈亏: {profit:+.2f}")
+                elif target_position == -1:
+                    exec_price = close_price * (1 - self.slippage)
+                    fee = capital * self.commission_rate
+                    capital -= fee
+                    entry_price = exec_price
+                    min_price_since_entry = exec_price
+                    position = -1
+                    trade_records.append({"type": "OPEN_SHORT", "price": exec_price, "fee": fee, "date": current_date, "reason": reason})
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [建立空头] 价格: {exec_price:.2f} | 理由: {reason}")
+            else:
+                # 仓位保持不变时打印简要状态
+                pos_str = "多头持仓中" if position == 1 else "空头持仓中" if position == -1 else "空仓观望"
+                print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [维持立场: {stance}] 当前状态: {pos_str} | 收盘价: {close_price:.2f}")
 
-        total_return = (capital - initial_capital) / initial_capital * 100
-        print("\n==================================================")
-        print(f"📊 回测结束 | 初始资金: {initial_capital:.2f} | 最终资金: {capital:.2f}")
-        print(f"📈 累计收益率: {total_return:+.2f}%")
-        print(f"🔄 总交易次数 (包含平仓): {trade_count} 次")
-        print("==================================================")
+            # 动态资产估值
+            if position == 1:
+                cur_val = capital * (close_price / entry_price)
+            elif position == -1:
+                cur_val = capital * (1 + (entry_price - close_price) / entry_price)
+            else:
+                cur_val = capital
+            equity_curve.append(cur_val)
+
+        # 回测结束强制清算
+        if position != 0:
+            final_price = float(df['Close'].iloc[-1])
+            pnl = (final_price - entry_price) / entry_price * capital if position == 1 else (entry_price - final_price) / entry_price * capital
+            capital += pnl * (1 - self.commission_rate)
+
+        self._print_summary(equity_curve, initial_capital, trade_records, df)
+
+    def _print_summary(self, equity_curve, initial_capital, trade_records, df):
+        equity = pd.Series(equity_curve)
+        total_return = (equity.iloc[-1] - initial_capital) / initial_capital
+        benchmark_return = (df['Close'].iloc[-1] - df['Close'].iloc[30]) / df['Close'].iloc[30]
+        max_dd = ((equity.cummax() - equity) / equity.cummax()).max()
+
+        winning = [t for t in trade_records if t.get("pnl", 0) > 0]
+        losing = [t for t in trade_records if t.get("pnl", 0) < 0]
+        win_rate = len(winning) / max(len(winning) + len(losing), 1)
+
+        print("\n" + "=" * 50)
+        print("                 回测绩效评估报告                 ")
+        print("=" * 50)
+        print(f"初始本金:             {initial_capital:,.2f}")
+        print(f"期末总资产:           {equity.iloc[-1]:,.2f}")
+        print(f"策略累计收益率:       {total_return:+.2%}")
+        print(f"基准收益率 (买入持有): {benchmark_return:+.2%}")
+        print(f"最大回撤 (Max DD):    {max_dd:.2%}")
+        print(f"交易总笔数:           {len(trade_records)} 笔")
+        print(f"平仓胜率 (Win Rate):  {win_rate:.2%}")
+        print("=" * 50)
