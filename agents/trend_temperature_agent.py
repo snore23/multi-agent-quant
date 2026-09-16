@@ -2,38 +2,25 @@
 import pandas as pd
 import numpy as np
 
+
 class TrendTemperatureAgent:
-    def __init__(self, ema_fast=5, ema_mid=10, ema_slow=20, channel_period=20):
-        """
-        :param ema_fast: 快速指数移动平均线周期
-        :param ema_mid: 中速指数移动平均线周期
-        :param ema_slow: 慢速指数移动平均线周期
-        :param channel_period: 唐奇安通道（自适应创高低）周期
-        """
+    def __init__(self, ema_fast=10, ema_mid=20, ema_slow=40, channel_period=20):
         self.ema_fast = ema_fast
         self.ema_mid = ema_mid
         self.ema_slow = ema_slow
         self.channel_period = channel_period
 
     def analyze(self, df_window):
-        """
-        基于趋势动物的“趋势温度”思想：
-        输入过去时间步的 DataFrame，计算趋势温度评分（0 - 100 分）。
-        输出分析报告文本，作为技术面决策依据。
-        """
-        # 确保传入的窗口长度足够计算均线和通道（我们把窗口改到 30 天）
+        # 兼容当前窗口长度
         if len(df_window) < self.channel_period:
-            return "趋势温度分析师报告：当前滑动窗口数据不足，建议观望。"
+            return "趋势温度报告：预热数据不足，建议观望。"
 
         close_series = df_window['Close']
         high_series = df_window['High']
         low_series = df_window['Low']
         current_close = float(close_series.iloc[-1])
 
-        # ==========================================
-        # 维度一：均线排列度得分 (满分 50 分)
-        # ==========================================
-        # 计算近期 EMA 均线
+        # 1. 均线多头排列得分 (满分 50 分)
         ema_f = close_series.ewm(span=self.ema_fast, adjust=False).mean().iloc[-1]
         ema_m = close_series.ewm(span=self.ema_mid, adjust=False).mean().iloc[-1]
         ema_s = close_series.ewm(span=self.ema_slow, adjust=False).mean().iloc[-1]
@@ -45,35 +32,30 @@ class TrendTemperatureAgent:
         if ema_f > ema_m: ma_score += 10
         if ema_m > ema_s: ma_score += 10
 
-        # ==========================================
-        # 维度二：创近期新高强度（唐奇安通道位置，满分 50 分）
-        # ==========================================
+        # 2. 通道强度得分 (满分 50 分)
         recent_high = float(high_series.iloc[-self.channel_period:].max())
         recent_low = float(low_series.iloc[-self.channel_period:].min())
 
         if recent_high == recent_low:
             channel_score = 25.0
         else:
-            # 计算当前收盘价在近期价格通道中的百分比位置
             channel_score = ((current_close - recent_low) / (recent_high - recent_low)) * 50.0
 
-        # ==========================================
-        # 汇总：趋势温度评分 (0 - 100)
-        # ==========================================
         temp_score = ma_score + channel_score
+        is_above_slow_ma = current_close > ema_s
 
-        # 趋势温度映射：[冻, 寒, 凉, 平, 温, 热, 沸]
+        # 3. 输出细分的市场形态
         if temp_score >= 70:
-            temp_level = f"热/沸 (Hot/Boiling) [分值: {temp_score:.1f}]"
-            signal = "看涨 (Buy)"
-        elif temp_score <= 30:
-            temp_level = f"冻/寒 (Freezing/Cold) [分值: {temp_score:.1f}]"
-            signal = "看跌 (Sell)"
+            pattern = "强烈看涨 (BULLISH)"
+            desc = "高热上升通道，均线与通道共振创新高"
+        elif temp_score >= 45 and is_above_slow_ma:
+            pattern = "多头良性回调 (BULLISH_HOLD)"
+            desc = "处于多头中继支撑区，主趋势未破，建议持仓者拿住、空仓者观望"
+        elif temp_score <= 25 and not is_above_slow_ma:
+            pattern = "破位看跌 (BEARISH)"
+            desc = "跌破长期均线支撑，空头主导"
         else:
-            temp_level = f"温/平/凉 (Neutral) [分值: {temp_score:.1f}]"
-            signal = "震荡/观望 (Wait)"
+            pattern = "中性震荡 (NEUTRAL)"
+            desc = "方向不明或宽幅震荡，建议防御"
 
-        return (
-            f"趋势温度分析师报告：当前标的近期趋势温度评分为 {temp_score:.1f}，"
-            f"处于 【{temp_level}】 状态。均线多头排列与通道创高共振，呈现 {signal} 模式。"
-        )
+        return f"趋势温度报告：当前评分 {temp_score:.1f}，均线长期支撑处于{'上方' if is_above_slow_ma else '下方'}。形态判定为【{pattern}】，理由：{desc}。"

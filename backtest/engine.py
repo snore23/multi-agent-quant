@@ -19,9 +19,10 @@ class BacktestEngine:
         df = get_stock_kline(ticker, period=period, start_date=start_date, end_date=end_date)
         df.reset_index(drop=True, inplace=True)
 
+        lookback = 60  # 预热窗口扩充为 60 天，为指标提供充分的历史数据
         total_steps = len(df)
-        if total_steps < 40:
-            print("[ERROR] 数据量不足，无法运行。")
+        if total_steps <= lookback:
+            print("[ERROR] 数据量不足以支持 60 天预热窗口。")
             return
 
         initial_capital = 100000.0
@@ -34,16 +35,16 @@ class BacktestEngine:
         trailing_stop_pct = 0.12
 
         trade_records = []
-        equity_curve = [initial_capital] * 30
+        equity_curve = [initial_capital] * lookback
 
-        print(f"[INFO] 历史数据加载完成，有效交易日共 {total_steps} 天，开始滑动回测...\n")
+        print(f"[INFO] 历史数据加载完成，有效交易日共 {total_steps} 天，从第 {lookback} 天开始回测...\n")
 
-        for i in range(30, total_steps):
-            window_df = df.iloc[i - 30:i]
+        for i in range(lookback, total_steps):
+            window_df = df.iloc[i - lookback:i]
             today_bar = df.iloc[i]
             current_date = today_bar['datetime']
             close_price = float(today_bar['Close'])
-            step_progress = f"[{i - 29}/{total_steps - 30}]"
+            step_progress = f"[{i - lookback + 1}/{total_steps - lookback}]"
 
             # 1. 硬性止损与移动追踪止盈检查
             stop_triggered = False
@@ -60,7 +61,7 @@ class BacktestEngine:
                     capital += (pnl - fee)
                     reason = "多头移动止盈" if close_price < trailing_line else "多头硬性止损"
                     trade_records.append({"type": "CLOSE_LONG", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": reason})
-                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [平仓触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [止盈/止损触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
                     position = 0
                     entry_price = 0.0
                     stop_triggered = True
@@ -77,7 +78,7 @@ class BacktestEngine:
                     capital += (pnl - fee)
                     reason = "空头移动止盈" if close_price > trailing_line else "空头硬性止损"
                     trade_records.append({"type": "CLOSE_SHORT", "price": exec_price, "pnl": pnl, "fee": fee, "date": current_date, "reason": reason})
-                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [平仓触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
+                    print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [止盈/止损触发] {reason} | 价格: {exec_price:.2f} | 盈亏: {pnl:+.2f} | 总资产: {capital:.2f}")
                     position = 0
                     entry_price = 0.0
                     stop_triggered = True
@@ -86,7 +87,7 @@ class BacktestEngine:
                 equity_curve.append(capital)
                 continue
 
-            # 2. 智能体分析与决策
+            # 2. 智能体研判
             tech_report = self.tech_agent.analyze(window_df)
             news_report = self.news_agent.analyze(ticker, current_date)
             risk_report = self.risk_agent.analyze(window_df)
@@ -101,11 +102,23 @@ class BacktestEngine:
                 stance = "NEUTRAL"
                 reason = "解析兜底"
 
-            target_position = 1 if stance == "BULLISH" else -1 if stance == "BEARISH" else 0
+            # 3. 迟滞状态机映射逻辑
+            # BULLISH -> 开多 / 拿住
+            # BULLISH_HOLD -> 如果有多头则拿住，如果是空仓则不追高观望
+            # NEUTRAL -> 平掉多头/空头，回归现金
+            # BEARISH -> 平多开空
+            if stance == "BULLISH":
+                target_position = 1
+            elif stance == "BULLISH_HOLD":
+                target_position = 1 if position == 1 else 0
+            elif stance == "BEARISH":
+                target_position = -1
+            else:  # NEUTRAL
+                target_position = 0
 
-            # 3. 状态机执行
+            # 4. 执行状态变更
             if target_position != position:
-                # 平掉旧仓
+                # 先平旧仓
                 if position == 1:
                     exec_price = close_price * (1 - self.slippage)
                     pnl = (exec_price - entry_price) / entry_price * capital
@@ -144,10 +157,10 @@ class BacktestEngine:
                     position = -1
                     trade_records.append({"type": "OPEN_SHORT", "price": exec_price, "fee": fee, "date": current_date, "reason": reason})
                     print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [建立空头] 价格: {exec_price:.2f} | 理由: {reason}")
+
             else:
-                # 仓位保持不变时打印简要状态
                 pos_str = "多头持仓中" if position == 1 else "空头持仓中" if position == -1 else "空仓观望"
-                print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [维持立场: {stance}] 当前状态: {pos_str} | 收盘价: {close_price:.2f}")
+                print(f"{step_progress} {current_date.strftime('%Y-%m-%d')} | [立场: {stance}] 状态: {pos_str} | 收盘价: {close_price:.2f}")
 
             # 动态资产估值
             if position == 1:
@@ -164,12 +177,12 @@ class BacktestEngine:
             pnl = (final_price - entry_price) / entry_price * capital if position == 1 else (entry_price - final_price) / entry_price * capital
             capital += pnl * (1 - self.commission_rate)
 
-        self._print_summary(equity_curve, initial_capital, trade_records, df)
+        self._print_summary(equity_curve, initial_capital, trade_records, df, lookback)
 
-    def _print_summary(self, equity_curve, initial_capital, trade_records, df):
+    def _print_summary(self, equity_curve, initial_capital, trade_records, df, lookback):
         equity = pd.Series(equity_curve)
         total_return = (equity.iloc[-1] - initial_capital) / initial_capital
-        benchmark_return = (df['Close'].iloc[-1] - df['Close'].iloc[30]) / df['Close'].iloc[30]
+        benchmark_return = (df['Close'].iloc[-1] - df['Close'].iloc[lookback]) / df['Close'].iloc[lookback]
         max_dd = ((equity.cummax() - equity) / equity.cummax()).max()
 
         winning = [t for t in trade_records if t.get("pnl", 0) > 0]
