@@ -1,158 +1,250 @@
 # download_news.py
 import os
-import time
-import random
-import datetime
-import urllib.parse
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 
 
-def download_news_from_baidu(ticker="105.NVDA", start_year=2023, end_year=2024):
+def get_sec_cik(ticker_symbol):
+    url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {"User-Agent": "GlobalQuantFund research_analytics_2026@outlook.com"}
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data.values():
+                if item["ticker"].upper() == ticker_symbol.upper():
+                    return str(item["cik_str"]).zfill(10), item["title"]
+    except Exception as e:
+        print(f"[WARN] 获取 SEC CIK 失败: {e}")
+    return None, ticker_symbol
+
+
+def fetch_and_calculate_dynamic_metrics(cik):
     """
-    通过百度资讯获取任意股票的历史真实新闻。
-    将时间明文作为核心搜索词，并进行全局标题去重，彻底解决数据重复问题。
+    全量聚合 SEC Revenues 与全科目池，按会计截止日提取顶层合并总营收，并动态计算 QoQ/YoY
     """
-    symbol = ticker.split('.')[-1] if '.' in ticker else ticker
-    print(f"⏳ 开始获取 [{symbol}] 的真实历史新闻 ({start_year} - {end_year})...")
-
-    news_records = []
-
-    # 建立一个全局去重集合，确保整张 CSV 里的新闻headline绝不重复
-    seen_headlines = set()
-
-    months = [
-        (1, "1月"), (2, "2月"), (3, "3月"), (4, "4月"), (5, "5月"), (6, "6月"),
-        (7, "7月"), (8, "8月"), (9, "9月"), (10, "10月"), (11, "11月"), (12, "12月")
+    headers = {"User-Agent": "GlobalQuantFund research_analytics_2026@outlook.com"}
+    concept_tags = [
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet"
     ]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://news.baidu.com/",
-        "Connection": "keep-alive"
+    all_raw_units = []
+    for tag in concept_tags:
+        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{tag}.json"
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                units = data.get("units", {}).get("USD", [])
+                if units:
+                    all_raw_units.extend(units)
+        except Exception:
+            continue
+
+    if not all_raw_units:
+        print("[WARN] SEC 接口未返回营业收入科目。")
+        return []
+
+    raw_records = []
+    for item in all_raw_units:
+        form = item.get("form")
+        fp = item.get("fp", "")
+        fy = item.get("fy")
+        val = item.get("val")
+        filed = item.get("filed")
+        start = item.get("start")
+        end = item.get("end")
+
+        if form in ["10-Q", "10-K"] and filed and val and start and end:
+            raw_records.append({
+                "filed": filed,
+                "start": start,
+                "end": end,
+                "val": val,
+                "form": form,
+                "fp": fp,
+                "fy": fy
+            })
+
+    df = pd.DataFrame(raw_records)
+    if df.empty:
+        return []
+
+    df['start'] = pd.to_datetime(df['start'])
+    df['end'] = pd.to_datetime(df['end'])
+    df['filed'] = pd.to_datetime(df['filed'])
+    df['days'] = (df['end'] - df['start']).dt.days
+    df['val_b'] = df['val'] / 1e9
+
+    results = []
+
+    # 1. 单季处理 (10-Q): 限制 70~115 天，按 end 截止日取最大值(保证取到顶层合并总营收)
+    df_q = df[(df['form'] == '10-Q') & (df['days'] >= 70) & (df['days'] <= 115)]
+    if not df_q.empty:
+        # 按 end 分组取最大营收，确保取到集团合并报表总数
+        idx_max = df_q.groupby('end')['val_b'].idxmax()
+        df_q = df_q.loc[idx_max].sort_values('end').reset_index(drop=True)
+
+        for i, row in df_q.iterrows():
+            val_b = row['val_b']
+            fy = row['fy']
+            fp = row['fp']
+            filed_dt = row['filed']
+
+            qoq_str = ""
+            if i > 0:
+                prev_val = df_q.iloc[i - 1]['val_b']
+                if prev_val > 0:
+                    qoq = (val_b - prev_val) / prev_val * 100
+                    qoq_str = f"，单季环比增长: {qoq:+.1f}%"
+
+            desc = f"{fy} {fp} 单季总营收: {val_b:.2f} 亿美元{qoq_str}"
+            results.append({"filed_dt": filed_dt, "desc": desc})
+
+    # 2. 全年处理 (10-K): 限制 >300 天，按 end 分组取最大合并值
+    df_a = df[(df['form'] == '10-K') & (df['days'] > 300)]
+    if not df_a.empty:
+        idx_max_a = df_a.groupby('end')['val_b'].idxmax()
+        df_a = df_a.loc[idx_max_a].sort_values('end').reset_index(drop=True)
+
+        for i, row in df_a.iterrows():
+            val_b = row['val_b']
+            fy = row['fy']
+            filed_dt = row['filed']
+
+            yoy_str = ""
+            if i > 0:
+                prev_val = df_a.iloc[i - 1]['val_b']
+                if prev_val > 0:
+                    yoy = (val_b - prev_val) / prev_val * 100
+                    yoy_str = f"，全财年同比增长: {yoy:+.1f}%"
+
+            desc = f"{fy} 全财年累计总营收: {val_b:.2f} 亿美元{yoy_str}"
+            results.append({"filed_dt": filed_dt, "desc": desc})
+
+    print(f"[INFO] 成功自 SEC 动态解析到 {len(results)} 个历史财期的顶层合并财务指标。")
+    return results
+
+
+def decode_sec_items(items_str):
+    item_map = {
+        "2.02": "季度业绩与财务状况发布",
+        "1.01": "重大商业协议签署",
+        "5.02": "董事与核心高管任免变动",
+        "5.07": "股东大会表决结果公布",
+        "7.01": "Reg FD 公开业务说明会",
+        "8.01": "重要监管与业务事项披露 (含出口管制政策)"
     }
+    if not items_str or not isinstance(items_str, str):
+        return "公司常规运营事项"
+    decoded = []
+    for code, desc in item_map.items():
+        if code in items_str:
+            decoded.append(desc)
+    return " | ".join(decoded) if decoded else f"事项代码: {items_str}"
 
-    session = requests.Session()
 
-    for year in range(start_year, end_year + 1):
-        for month_num, month_cn in months:
-            if year == end_year and month_num > 4:
-                break
+def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="2024-04-01"):
+    symbol = ticker.split('.')[-1] if '.' in ticker else ticker
+    print(f"\n==================================================")
+    print(f"[START] 全自动动态生成标的 [{symbol}] 量化基本面档案 [{start_date} 至 {end_date}]")
+    print(f"==================================================")
 
-            # --- 核心改进：把时间戳作为硬性搜索条件明文写入查询词（wd），用双引号强制精确匹配 ---
-            # 例如: NVDA "2023年1月"
-            query = f'{symbol} "{year}年{month_num}月"'
-            encoded_query = urllib.parse.quote(query)
-
-            url = f"https://www.baidu.com/s?tn=news&rtt=4&bsst=1&cl=2&wd={encoded_query}"
-
-            print(f"🔍 正在检索: {query} ...")
-
-            try:
-                response = session.get(url, headers=headers, timeout=10)
-
-                if response.status_code != 200:
-                    print(f"  ⚠️ 百度接口异常，状态码: {response.status_code}")
-                    continue
-
-                if "安全验证" in response.text or "网络状况不佳" in response.text:
-                    print("  ⚠️ 触发了百度的反爬验证码，本次检索跳过。")
-                    continue
-
-                soup = BeautifulSoup(response.text, 'html.parser')
-
-                content_left = soup.find('div', id='content_left')
-                if not content_left:
-                    print("  ⚠️ 未能定位到新闻内容区。")
-                    continue
-
-                news_items = content_left.find_all('div', class_=lambda x: x and ('result-op' in x or 'result' in x))
-
-                month_records_count = 0
-                simulated_date = f"{year}-{month_num:02d}-15"
-
-                for item in news_items:
-                    a_tag = (
-                            item.find('a', class_=lambda x: x and 'title' in x.lower())
-                            or (item.find('h3').find('a') if item.find('h3') else None)
-                            or item.find('a')
-                    )
-                    if not a_tag:
-                        continue
-
-                    headline = a_tag.get_text().strip()
-
-                    # 过滤导航条干扰
-                    ignore_keywords = ["百度", "登录", "注册", "百度一下", "百度首页", "百度热搜", "安全验证",
-                                       "百度资讯"]
-                    if any(kw in headline for kw in ignore_keywords):
-                        continue
-
-                    # --- 核心改进：全局标题去重，防止同月转载新闻和跨月重复推荐的新闻被记录 ---
-                    if headline in seen_headlines:
-                        continue
-
-                    summary_tag = (
-                            item.find('span', class_=lambda x: x and 'c-color-text' in x)
-                            or item.find('div', class_=lambda x: x and 'c-span-last' in x)
-                    )
-                    summary = summary_tag.get_text().strip() if summary_tag else ""
-
-                    if not summary:
-                        summary = item.get_text().replace(headline, "").strip()[:150]
-
-                    summary = summary.replace("\xa0", " ").strip()
-
-                    # 时间穿梭校验
-                    has_lookahead_bias = False
-                    for future_y in range(year + 1, 2027):
-                        if str(future_y) in headline or str(future_y) in summary:
-                            has_lookahead_bias = True
-                            break
-
-                    if has_lookahead_bias:
-                        continue
-
-                    if symbol.lower() in headline.lower() or symbol.lower() in summary.lower():
-                        # 通过所有校验，写入去重集合
-                        seen_headlines.add(headline)
-
-                        news_records.append({
-                            "datetime": simulated_date,
-                            "headline": headline,
-                            "summary": summary
-                        })
-                        month_records_count += 1
-
-                        # 每个月保留 2~3 条高价值新闻已足够 RAG 运作
-                        if month_records_count >= 3:
-                            break
-
-                print(f"  📊 成功获取并过滤该月真实新闻 {month_records_count} 条。")
-                time.sleep(random.uniform(2.5, 4.5))
-
-            except Exception as e:
-                print(f"  ⚠️ 检索发生异常: {e}，跳过该月...")
-                time.sleep(3)
-                continue
-
-    if not news_records:
-        print("\n❌ 未提取到有效新闻。")
+    cik, company_name = get_sec_cik(symbol)
+    if not cik:
+        print(f"[ERROR] 无法获取 [{symbol}] 的 CIK 代码。")
         return
 
-    # 导出
-    df = pd.DataFrame(news_records)
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df = df.sort_values(by='datetime')
+    # 1. 动态计算顶层合并财务指标
+    fin_records = fetch_and_calculate_dynamic_metrics(cik)
 
-    os.makedirs("data", exist_ok=True)
-    save_path = f"data/{symbol}_news.csv"
-    df.to_csv(save_path, index=False)
-    print(f"\n✅ 成功使用【明文过滤 + 全局去重】重新下载 [{symbol}] 的历史新闻！共 {len(df)} 条报道已保存至: {save_path}")
+    # 2. 动态抓取 SEC 披露事件
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
+    headers = {"User-Agent": "GlobalQuantFund research_analytics_2026@outlook.com"}
+
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            print(f"[ERROR] SEC 接口异常: {res.status_code}")
+            return
+
+        data = res.json()
+        recent = data.get("filings", {}).get("recent", {})
+        forms = recent.get("form", [])
+        filing_dates = recent.get("filingDate", [])
+        primary_docs = recent.get("primaryDocDescription", [])
+        items_list = recent.get("items", [])
+
+        date_aggregated = {}
+        target_forms = {"8-K", "10-Q", "10-K"}
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
+        for i in range(len(forms)):
+            form_type = forms[i]
+            if form_type in target_forms:
+                f_date_str = filing_dates[i]
+                f_date = pd.to_datetime(f_date_str)
+
+                if start_dt <= f_date <= end_dt:
+                    items_raw = items_list[i] if i < len(items_list) else ""
+                    decoded_desc = decode_sec_items(items_raw)
+                    doc_desc = primary_docs[i] if i < len(primary_docs) and primary_docs[i] else form_type
+
+                    if f_date_str not in date_aggregated:
+                        date_aggregated[f_date_str] = {
+                            "dt": f_date,
+                            "forms": set(),
+                            "items": set(),
+                            "doc_desc": doc_desc
+                        }
+                    date_aggregated[f_date_str]["forms"].add(form_type)
+                    if decoded_desc != "公司常规运营事项":
+                        date_aggregated[f_date_str]["items"].add(decoded_desc)
+
+        records = []
+        for f_date_str, info in date_aggregated.items():
+            f_dt = info["dt"]
+            forms_str = "/".join(sorted(info["forms"]))
+            items_summary = " | ".join(info["items"]) if info["items"] else "定期财务报告归档"
+
+            # 7天动态匹配窗口
+            matched_fin_text = ""
+            for fin in fin_records:
+                if abs((fin["filed_dt"] - f_dt).days) <= 7:
+                    matched_fin_text = f"【量化财务指标: {fin['desc']}】"
+                    break
+
+            headline = f"{company_name} 官方披露 (Form {forms_str}: {items_summary})"
+            summary = f"SEC官方归档: {items_summary}。{matched_fin_text} 详细文档: {info['doc_desc']}"
+
+            records.append({
+                "datetime": f_date_str,
+                "headline": headline,
+                "summary": summary
+            })
+
+        df = pd.DataFrame(records)
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values(by='datetime').reset_index(drop=True)
+
+        os.makedirs("data", exist_ok=True)
+        save_path = f"data/{symbol}_news.csv"
+        df.to_csv(save_path, index=False)
+
+        print(f"\n[SUCCESS] 动态量化基本面档案已生成: {save_path}")
+        print(f"有效事件数: {len(df)} 条")
+        print("\n--- 提取到的顶层合并财务事件预览 ---")
+        for _, row in df.iterrows():
+            date_str = pd.to_datetime(row['datetime']).strftime('%Y-%m-%d')
+            print(f"[{date_str}] {row['headline']}")
+            print(f"       -> {row['summary']}\n")
+
+    except Exception as e:
+        print(f"[ERROR] 执行失败: {e}")
 
 
 if __name__ == "__main__":
-    download_news_from_baidu(ticker="105.NVDA", start_year=2023, end_year=2024)
+    download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="2024-04-01")
