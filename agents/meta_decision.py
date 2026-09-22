@@ -1,4 +1,5 @@
 # agents/meta_decision.py
+import re
 import json
 import hashlib
 from openai import OpenAI
@@ -15,10 +16,19 @@ class MetaDecisionAgent:
         )
         self.decision_cache = {}
 
+    def _generate_cache_key(self, tech_report, news_report, risk_report):
+        """
+        提取结构化语义特征生成哈希，避免技术面连续浮点数微小扰动击穿缓存。
+        """
+        tech_pattern_match = re.search(r"【(.*?)】", tech_report)
+        tech_pattern = tech_pattern_match.group(1) if tech_pattern_match else tech_report[:30]
+
+        risk_state = "RISK_ALERT" if "ALERT" in risk_report or "STOP" in risk_report else "RISK_OK"
+        normalized_str = f"{tech_pattern}_{news_report.strip()}_{risk_state}"
+        return hashlib.md5(normalized_str.encode('utf-8')).hexdigest()
+
     def make_decision(self, tech_report, news_report, risk_report):
-        cache_key = hashlib.md5(
-            f"{tech_report}_{news_report}_{risk_report}".encode('utf-8')
-        ).hexdigest()
+        cache_key = self._generate_cache_key(tech_report, news_report, risk_report)
 
         if cache_key in self.decision_cache:
             return self.decision_cache[cache_key]
@@ -57,6 +67,10 @@ class MetaDecisionAgent:
             parsed = json.loads(json_result)
             if "stance" not in parsed or "reason" not in parsed:
                 raise ValueError("JSON 缺少必要字段")
+
+            if parsed["stance"] not in ["BULLISH", "BULLISH_HOLD", "BEARISH", "NEUTRAL"]:
+                parsed["stance"] = "NEUTRAL"
+                json_result = json.dumps(parsed, ensure_ascii=False)
 
             self.decision_cache[cache_key] = json_result
             return json_result

@@ -38,23 +38,22 @@ class FundamentalNewsAgent:
         )
         self.chain = self.prompt | self.llm | StrOutputParser()
         self.news_sentiment_cache = {}
+        self.local_news_df = None
 
     def fetch_historical_news(self, ticker, current_date):
         symbol = ticker.split('.')[-1] if '.' in ticker else ticker
 
-        if not hasattr(self, 'local_news_df') or self.local_news_df is None:
-            self.local_news_df = None
+        if self.local_news_df is None:
             local_file = f"data/{symbol}_news.csv"
             if os.path.exists(local_file):
                 try:
                     df = pd.read_csv(local_file)
                     df['datetime'] = pd.to_datetime(df['datetime'])
-                    self.local_news_df = df
+                    self.local_news_df = df.sort_values(by='datetime').reset_index(drop=True)
                     print(f"[News Agent] 挂载 [{symbol}] 动态历史情报库成功。")
                 except Exception as e:
                     print(f"[News Agent] 挂载本地库失败: {e}")
 
-        # 检索当前日期前 30 天内发生的真实重大披露
         if self.local_news_df is not None and not self.local_news_df.empty:
             start_date = current_date - timedelta(days=30)
             mask = (self.local_news_df['datetime'] >= start_date) & (self.local_news_df['datetime'] <= current_date)

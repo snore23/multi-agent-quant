@@ -21,7 +21,7 @@ def get_sec_cik(ticker_symbol):
 
 def fetch_and_calculate_dynamic_metrics(cik):
     """
-    全量聚合 SEC Revenues 与全科目池，按会计截止日提取顶层合并总营收，并动态计算 QoQ/YoY
+    聚合 SEC Revenues 科目，按会计截止日提取顶层合并总营收，并动态计算 QoQ/YoY
     """
     headers = {"User-Agent": "GlobalQuantFund research_analytics_2026@outlook.com"}
     concept_tags = [
@@ -80,10 +80,9 @@ def fetch_and_calculate_dynamic_metrics(cik):
 
     results = []
 
-    # 1. 单季处理 (10-Q): 限制 70~115 天，按 end 截止日取最大值(保证取到顶层合并总营收)
+    # 1. 单季处理 (10-Q): 限制 70~115 天
     df_q = df[(df['form'] == '10-Q') & (df['days'] >= 70) & (df['days'] <= 115)]
     if not df_q.empty:
-        # 按 end 分组取最大营收，确保取到集团合并报表总数
         idx_max = df_q.groupby('end')['val_b'].idxmax()
         df_q = df_q.loc[idx_max].sort_values('end').reset_index(drop=True)
 
@@ -103,7 +102,7 @@ def fetch_and_calculate_dynamic_metrics(cik):
             desc = f"{fy} {fp} 单季总营收: {val_b:.2f} 亿美元{qoq_str}"
             results.append({"filed_dt": filed_dt, "desc": desc})
 
-    # 2. 全年处理 (10-K): 限制 >300 天，按 end 分组取最大合并值
+    # 2. 全年处理 (10-K): 限制 >300 天
     df_a = df[(df['form'] == '10-K') & (df['days'] > 300)]
     if not df_a.empty:
         idx_max_a = df_a.groupby('end')['val_b'].idxmax()
@@ -148,19 +147,17 @@ def decode_sec_items(items_str):
 
 def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="2024-04-01"):
     symbol = ticker.split('.')[-1] if '.' in ticker else ticker
-    print(f"\n==================================================")
-    print(f"[START] 全自动动态生成标的 [{symbol}] 量化基本面档案 [{start_date} 至 {end_date}]")
-    print(f"==================================================")
+    print("=" * 50)
+    print(f"[START] 动态生成标的 [{symbol}] 量化基本面档案 [{start_date} 至 {end_date}]")
+    print("=" * 50)
 
     cik, company_name = get_sec_cik(symbol)
     if not cik:
         print(f"[ERROR] 无法获取 [{symbol}] 的 CIK 代码。")
         return
 
-    # 1. 动态计算顶层合并财务指标
     fin_records = fetch_and_calculate_dynamic_metrics(cik)
 
-    # 2. 动态抓取 SEC 披露事件
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     headers = {"User-Agent": "GlobalQuantFund research_analytics_2026@outlook.com"}
 
@@ -210,10 +207,11 @@ def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="
             forms_str = "/".join(sorted(info["forms"]))
             items_summary = " | ".join(info["items"]) if info["items"] else "定期财务报告归档"
 
-            # 7天动态匹配窗口
+            # 严格消除未来信息：财务指标归档日期必须早于或等于当前事件日期 (0 <= (f_dt - fin_filed_dt).days <= 7)
             matched_fin_text = ""
             for fin in fin_records:
-                if abs((fin["filed_dt"] - f_dt).days) <= 7:
+                diff_days = (f_dt - fin["filed_dt"]).days
+                if 0 <= diff_days <= 7:
                     matched_fin_text = f"【量化财务指标: {fin['desc']}】"
                     break
 
@@ -234,13 +232,7 @@ def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="
         save_path = f"data/{symbol}_news.csv"
         df.to_csv(save_path, index=False)
 
-        print(f"\n[SUCCESS] 动态量化基本面档案已生成: {save_path}")
-        print(f"有效事件数: {len(df)} 条")
-        print("\n--- 提取到的顶层合并财务事件预览 ---")
-        for _, row in df.iterrows():
-            date_str = pd.to_datetime(row['datetime']).strftime('%Y-%m-%d')
-            print(f"[{date_str}] {row['headline']}")
-            print(f"       -> {row['summary']}\n")
+        print(f"[SUCCESS] 动态量化基本面档案已生成: {save_path}，有效事件数: {len(df)} 条")
 
     except Exception as e:
         print(f"[ERROR] 执行失败: {e}")
