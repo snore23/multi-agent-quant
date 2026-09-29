@@ -55,7 +55,7 @@ class FundamentalNewsAgent:
                     print(f"[News Agent] 挂载本地库失败: {e}")
 
         if self.local_news_df is not None and not self.local_news_df.empty:
-            start_date = current_date - timedelta(days=30)
+            start_date = current_date - timedelta(days=15)
             mask = (self.local_news_df['datetime'] >= start_date) & (self.local_news_df['datetime'] <= current_date)
             day_news = self.local_news_df.loc[mask]
 
