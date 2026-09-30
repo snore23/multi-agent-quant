@@ -44,7 +44,7 @@ class BacktestEngine:
         self.trailing_stop_pct = trailing_stop_pct
         self.hard_stop_pct = hard_stop_pct
 
-    def run_backtest(self, ticker="105.NVDA", period="daily", start_date="2023-01-01", end_date="2024-04-01"):
+    def run_backtest(self, ticker: str, start_date: str, end_date: str, period: str = "daily"):
         print(f"\n[INFO] 开始回测标的: {ticker} [{start_date} 至 {end_date}]")
         print(f"[CONFIG] 做空允许: {self.allow_short} | 离场防抖确认: {self.exit_confirm_days} 天 | 手续费: {self.commission_rate:.2%} | 滑点: {self.slippage:.2%}")
 

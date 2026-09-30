@@ -58,10 +58,10 @@ def main():
 
     print(">>> 开始执行历史回测...")
     engine.run_backtest(
-        ticker="105.NVDA",
+        ticker="105.META",
         period="daily",
-        start_date="2023-01-01",
-        end_date="2024-04-01"
+        start_date="2022-01-01",
+        end_date="2023-12-31"
     )
 
 

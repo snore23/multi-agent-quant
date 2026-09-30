@@ -131,10 +131,11 @@ def decode_sec_items(items_str):
     item_map = {
         "2.02": "季度业绩与财务状况发布",
         "1.01": "重大商业协议签署",
+        "2.05": "重组或重大裁员计划执行",
         "5.02": "董事与核心高管任免变动",
         "5.07": "股东大会表决结果公布",
         "7.01": "Reg FD 公开业务说明会",
-        "8.01": "重要监管与业务事项披露 (含出口管制政策)"
+        "8.01": "重要监管与业务事项披露"
     }
     if not items_str or not isinstance(items_str, str):
         return "公司常规运营事项"
@@ -145,7 +146,7 @@ def decode_sec_items(items_str):
     return " | ".join(decoded) if decoded else f"事项代码: {items_str}"
 
 
-def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="2024-04-01"):
+def download_dynamic_news(ticker="105.META", start_date="2022-01-01", end_date="2023-12-31"):
     symbol = ticker.split('.')[-1] if '.' in ticker else ticker
     print("=" * 50)
     print(f"[START] 动态生成标的 [{symbol}] 量化基本面档案 [{start_date} 至 {end_date}]")
@@ -168,38 +169,56 @@ def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="
             return
 
         data = res.json()
-        recent = data.get("filings", {}).get("recent", {})
-        forms = recent.get("form", [])
-        filing_dates = recent.get("filingDate", [])
-        primary_docs = recent.get("primaryDocDescription", [])
-        items_list = recent.get("items", [])
+
+        # 收集所有的申报数据源 (包含 recent 和所有历史分页文件 files)
+        filing_payloads = []
+        if "filings" in data and "recent" in data["filings"]:
+            filing_payloads.append(data["filings"]["recent"])
+
+        # 抓取历史分片文件 (如 CIK...-submissions-001.json)
+        older_files = data.get("filings", {}).get("files", [])
+        for f_info in older_files:
+            shard_name = f_info.get("name")
+            shard_url = f"https://data.sec.gov/submissions/{shard_name}"
+            try:
+                shard_res = requests.get(shard_url, headers=headers, timeout=15)
+                if shard_res.status_code == 200:
+                    filing_payloads.append(shard_res.json())
+            except Exception:
+                continue
 
         date_aggregated = {}
         target_forms = {"8-K", "10-Q", "10-K"}
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
 
-        for i in range(len(forms)):
-            form_type = forms[i]
-            if form_type in target_forms:
-                f_date_str = filing_dates[i]
-                f_date = pd.to_datetime(f_date_str)
+        for payload in filing_payloads:
+            forms = payload.get("form", [])
+            filing_dates = payload.get("filingDate", [])
+            primary_docs = payload.get("primaryDocDescription", [])
+            items_list = payload.get("items", [])
 
-                if start_dt <= f_date <= end_dt:
-                    items_raw = items_list[i] if i < len(items_list) else ""
-                    decoded_desc = decode_sec_items(items_raw)
-                    doc_desc = primary_docs[i] if i < len(primary_docs) and primary_docs[i] else form_type
+            for i in range(len(forms)):
+                form_type = forms[i]
+                if form_type in target_forms:
+                    f_date_str = filing_dates[i]
+                    f_date = pd.to_datetime(f_date_str)
 
-                    if f_date_str not in date_aggregated:
-                        date_aggregated[f_date_str] = {
-                            "dt": f_date,
-                            "forms": set(),
-                            "items": set(),
-                            "doc_desc": doc_desc
-                        }
-                    date_aggregated[f_date_str]["forms"].add(form_type)
-                    if decoded_desc != "公司常规运营事项":
-                        date_aggregated[f_date_str]["items"].add(decoded_desc)
+                    if start_dt <= f_date <= end_dt:
+                        items_raw = items_list[i] if i < len(items_list) else ""
+                        decoded_desc = decode_sec_items(items_raw)
+                        doc_desc = primary_docs[i] if i < len(primary_docs) and primary_docs[i] else form_type
+
+                        if f_date_str not in date_aggregated:
+                            date_aggregated[f_date_str] = {
+                                "dt": f_date,
+                                "forms": set(),
+                                "items": set(),
+                                "doc_desc": doc_desc
+                            }
+                        date_aggregated[f_date_str]["forms"].add(form_type)
+                        if decoded_desc != "公司常规运营事项":
+                            date_aggregated[f_date_str]["items"].add(decoded_desc)
 
         records = []
         for f_date_str, info in date_aggregated.items():
@@ -207,7 +226,6 @@ def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="
             forms_str = "/".join(sorted(info["forms"]))
             items_summary = " | ".join(info["items"]) if info["items"] else "定期财务报告归档"
 
-            # 严格消除未来信息：财务指标归档日期必须早于或等于当前事件日期 (0 <= (f_dt - fin_filed_dt).days <= 7)
             matched_fin_text = ""
             for fin in fin_records:
                 diff_days = (f_dt - fin["filed_dt"]).days
@@ -224,19 +242,24 @@ def download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="
                 "summary": summary
             })
 
-        df = pd.DataFrame(records)
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.sort_values(by='datetime').reset_index(drop=True)
-
         os.makedirs("data", exist_ok=True)
         save_path = f"data/{symbol}_news.csv"
-        df.to_csv(save_path, index=False)
 
-        print(f"[SUCCESS] 动态量化基本面档案已生成: {save_path}，有效事件数: {len(df)} 条")
+        if records:
+            df = pd.DataFrame(records)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.sort_values(by='datetime').reset_index(drop=True)
+            df.to_csv(save_path, index=False)
+            print(f"[SUCCESS] 动态量化基本面档案已生成: {save_path}，有效事件数: {len(df)} 条")
+        else:
+            # 防御性生成空结构表
+            df = pd.DataFrame(columns=["datetime", "headline", "summary"])
+            df.to_csv(save_path, index=False)
+            print(f"[WARN] 所选时间段内未发现重大 SEC 官方披露，已生成空档案: {save_path}")
 
     except Exception as e:
         print(f"[ERROR] 执行失败: {e}")
 
 
 if __name__ == "__main__":
-    download_dynamic_news(ticker="105.NVDA", start_date="2023-01-01", end_date="2024-04-01")
+    download_dynamic_news(ticker="105.META", start_date="2022-01-01", end_date="2023-12-31")
